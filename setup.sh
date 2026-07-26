@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================
 #  GRE over IPsec Tunnel Manager
-#  Version: 1.0.0
+#  Version: 1.1.0
 # =============================================================
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 CONF_DIR="/etc/gre-ipsec"
 CONF_FILE="$CONF_DIR/tunnel.conf"
 UP_SH="$CONF_DIR/up.sh"
@@ -46,7 +46,9 @@ TUN_REMOTE=""
 PSK=""
 MTU=""
 IF_NAME="gre1"
+SWAN_SVC=""
 
+step() { echo -e "${GRY}>>${RST} ${C9}$1${RST}"; }
 ok()   { echo -e "${BG_OK} OK ${RST} ${FG_OK}$1${RST}"; }
 err()  { echo -e "${BG_ERR} ERROR ${RST} ${FG_ERR}$1${RST}"; }
 warn() { echo -e "${BG_WARN} WARN ${RST} ${FG_WARN}$1${RST}"; }
@@ -162,6 +164,16 @@ detect_public_ip() {
   ip="$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1); exit}')"
   [[ -z "$ip" ]] && ip="$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null)"
   echo "$ip"
+}
+
+detect_swan_svc() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^strongswan-starter\.service'; then
+    SWAN_SVC="strongswan-starter"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^strongswan\.service'; then
+    SWAN_SVC="strongswan"
+  else
+    SWAN_SVC=""
+  fi
 }
 
 # ---------- dependencies ----------
@@ -350,6 +362,17 @@ EOF
   touch /etc/ipsec.conf /etc/ipsec.secrets
   grep -qF "include $IPSEC_CONF" /etc/ipsec.conf || echo "include $IPSEC_CONF" >> /etc/ipsec.conf
   grep -qF "include $IPSEC_SECRETS" /etc/ipsec.secrets || echo "include $IPSEC_SECRETS" >> /etc/ipsec.secrets
+
+  # keep IKE retries short so the CLI never blocks for minutes on a dead peer
+  if [[ -d /etc/strongswan.d ]]; then
+    cat > /etc/strongswan.d/gre-ipsec.conf <<'CHEOF'
+charon {
+    retransmit_tries = 3
+    retransmit_timeout = 3.0
+    retransmit_base = 1.4
+}
+CHEOF
+  fi
 }
 
 apply_sysctl() {
@@ -392,30 +415,52 @@ do_install() {
   fi
 
   install_deps || { pause; return 1; }
+
+  step "Writing tunnel configuration"
   write_conf
+
+  step "Creating systemd unit"
   write_service
+
+  step "Writing IPsec configuration"
   write_ipsec
+
+  step "Applying sysctl settings"
   apply_sysctl
+
+  step "Opening firewall (udp/500, udp/4500, esp, gre)"
   open_firewall
 
-  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-  systemctl restart "$SERVICE_NAME" >/dev/null 2>&1
+  step "Enabling and starting GRE interface"
+  timeout 20 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+  timeout 30 systemctl restart "$SERVICE_NAME" >/dev/null 2>&1
 
-  systemctl enable strongswan-starter >/dev/null 2>&1 || systemctl enable strongswan >/dev/null 2>&1
-  ipsec restart >/dev/null 2>&1
+  detect_swan_svc
+  if [[ -n "$SWAN_SVC" ]]; then
+    step "Restarting strongSwan ($SWAN_SVC)"
+    timeout 20 systemctl enable "$SWAN_SVC" >/dev/null 2>&1
+    timeout 30 systemctl restart "$SWAN_SVC" >/dev/null 2>&1
+  else
+    step "Restarting strongSwan (legacy starter)"
+    timeout 30 ipsec restart >/dev/null 2>&1
+  fi
   sleep 3
-  ipsec up gre-ipsec >/dev/null 2>&1
 
+  step "Negotiating IPsec SA (max 20s, non-blocking)"
+  timeout 20 ipsec up gre-ipsec >/dev/null 2>&1
+
+  echo
   if ip link show "$IF_NAME" >/dev/null 2>&1; then
     ok "GRE interface $IF_NAME created."
   else
     err "GRE interface was not created. Check: journalctl -u $SERVICE_NAME"
   fi
 
-  if ipsec status 2>/dev/null | grep -q "ESTABLISHED"; then
+  if timeout 10 ipsec status 2>/dev/null | grep -q "ESTABLISHED"; then
     ok "IPsec SA established with $REMOTE_PUB."
   else
-    warn "IPsec not established yet. Configure the peer server, then run: ipsec up gre-ipsec"
+    warn "IPsec not established yet. This is normal until the peer is configured."
+    warn "After configuring the peer, run: ipsec up gre-ipsec"
   fi
 
   echo
@@ -448,14 +493,14 @@ show_info_body() {
     err "Interface $IF_NAME is down or missing."
   fi
 
-  if ipsec status 2>/dev/null | grep -q "ESTABLISHED"; then
+  if timeout 10 ipsec status 2>/dev/null | grep -q "ESTABLISHED"; then
     ok "IPsec tunnel is ESTABLISHED."
   else
     warn "IPsec tunnel is not established."
   fi
 
   echo -e "${GRY}Testing reachability to peer tunnel IP...${RST}"
-  if ping -c 2 -W 2 -I "$IF_NAME" "$TUN_REMOTE" >/dev/null 2>&1; then
+  if timeout 8 ping -c 2 -W 2 -I "$IF_NAME" "$TUN_REMOTE" >/dev/null 2>&1; then
     ok "Peer $TUN_REMOTE is reachable over the tunnel."
   else
     warn "Peer $TUN_REMOTE did not reply (peer may not be configured yet)."
@@ -508,13 +553,18 @@ manage_menu() {
     read -rp "$(echo -e "${C9}Select${RST} ${GRY}(${WHT}0${GRY})${RST}: ")" choice
     choice="${choice:-0}"
     case "$choice" in
-      1) systemctl start "$SERVICE_NAME" && ipsec up gre-ipsec >/dev/null 2>&1; ok "Started."; pause ;;
-      2) ipsec down gre-ipsec >/dev/null 2>&1; systemctl stop "$SERVICE_NAME"; ok "Stopped."; pause ;;
-      3) systemctl restart "$SERVICE_NAME"; ipsec restart >/dev/null 2>&1; sleep 2; ipsec up gre-ipsec >/dev/null 2>&1; ok "Restarted."; pause ;;
+      1) timeout 30 systemctl start "$SERVICE_NAME"; timeout 20 ipsec up gre-ipsec >/dev/null 2>&1; ok "Started."; pause ;;
+      2) timeout 15 ipsec down gre-ipsec >/dev/null 2>&1; timeout 30 systemctl stop "$SERVICE_NAME"; ok "Stopped."; pause ;;
+      3) detect_swan_svc
+         timeout 30 systemctl restart "$SERVICE_NAME"
+         if [[ -n "$SWAN_SVC" ]]; then timeout 30 systemctl restart "$SWAN_SVC" >/dev/null 2>&1; else timeout 30 ipsec restart >/dev/null 2>&1; fi
+         sleep 2; timeout 20 ipsec up gre-ipsec >/dev/null 2>&1; ok "Restarted."; pause ;;
       4) systemctl status "$SERVICE_NAME" --no-pager; pause ;;
-      5) ipsec statusall 2>/dev/null | head -40; pause ;;
-      6) ipsec up gre-ipsec; pause ;;
-      7) journalctl -u "$SERVICE_NAME" -n 40 --no-pager; echo; journalctl -u strongswan-starter -n 30 --no-pager 2>/dev/null; pause ;;
+      5) timeout 10 ipsec statusall 2>/dev/null | head -40; pause ;;
+      6) timeout 25 ipsec up gre-ipsec; pause ;;
+      7) journalctl -u "$SERVICE_NAME" -n 40 --no-pager
+         detect_swan_svc
+         echo; [[ -n "$SWAN_SVC" ]] && journalctl -u "$SWAN_SVC" -n 30 --no-pager 2>/dev/null; pause ;;
       0) return ;;
       *) err "Invalid option."; sleep 1 ;;
     esac
@@ -528,16 +578,17 @@ do_uninstall() {
   ask_choice "Remove tunnel and all its configuration? y/n" "n" c "y" "n" "Y" "N"
   [[ "${c,,}" == "y" ]] || return
 
-  ipsec down gre-ipsec >/dev/null 2>&1
-  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
+  timeout 15 ipsec down gre-ipsec >/dev/null 2>&1
+  timeout 30 systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1
   [[ -x "$DOWN_SH" ]] && "$DOWN_SH" >/dev/null 2>&1
-  rm -f "$SERVICE_FILE" "$IPSEC_CONF" "$IPSEC_SECRETS"
+  rm -f "$SERVICE_FILE" "$IPSEC_CONF" "$IPSEC_SECRETS" /etc/strongswan.d/gre-ipsec.conf
   sed -i "\|include $IPSEC_CONF|d" /etc/ipsec.conf 2>/dev/null
   sed -i "\|include $IPSEC_SECRETS|d" /etc/ipsec.secrets 2>/dev/null
   rm -rf "$CONF_DIR"
   rm -f /etc/sysctl.d/99-gre-ipsec.conf
   systemctl daemon-reload
-  ipsec restart >/dev/null 2>&1
+  detect_swan_svc
+  if [[ -n "$SWAN_SVC" ]]; then timeout 30 systemctl restart "$SWAN_SVC" >/dev/null 2>&1; else timeout 30 ipsec restart >/dev/null 2>&1; fi
   ok "Tunnel removed."
   pause
 }
