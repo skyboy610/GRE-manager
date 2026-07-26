@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================
 #  GRE over IPsec Tunnel Manager
-#  Version: 2.0.0
+#  Version: 2.1.0
 # =============================================================
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
+INSTALL_LOG="/var/log/gre-ipsec-install.log"
 CONF_DIR="/etc/gre-ipsec"
 CONF_FILE="$CONF_DIR/tunnel.conf"
 UP_SH="$CONF_DIR/up.sh"
@@ -56,6 +57,48 @@ PRIV_IP=""
 BOXW=56
 
 step() { echo -e "${GRY}>>${RST} ${C9}$1${RST}"; }
+
+kill_tree() {
+  local p="$1" sig="$2" c
+  for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c" "$sig"; done
+  kill "-$sig" "$p" 2>/dev/null
+}
+
+run_step() {
+  # $1 description, $2 timeout seconds, rest = command (may be a shell function)
+  local desc="$1" tmo="$2"; shift 2
+  local pid rc=0 elapsed=0
+  echo "----- $(date '+%F %T') : $desc -----" >> "$INSTALL_LOG" 2>/dev/null
+  if declare -F "$1" >/dev/null 2>&1 || ! command -v setsid >/dev/null 2>&1; then
+    ( "$@" ) >>"$INSTALL_LOG" 2>&1 &
+  else
+    setsid "$@" >>"$INSTALL_LOG" 2>&1 &
+  fi
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r${GRY}>>${RST} ${C9}%s${RST} ${GRY}[%ds]${RST}    " "$desc" "$elapsed"
+    sleep 1
+    elapsed=$((elapsed + 1))
+    if ((elapsed > tmo)); then
+      kill -TERM -- "-$pid" 2>/dev/null
+      kill_tree "$pid" TERM
+      sleep 2
+      kill -KILL -- "-$pid" 2>/dev/null
+      kill_tree "$pid" KILL
+      wait "$pid" 2>/dev/null
+      printf "\r%*s\r" 78 ""
+      err "$desc timed out after ${tmo}s"
+      return 124
+    fi
+  done
+  wait "$pid"; rc=$?
+  printf "\r%*s\r" 78 ""
+  if ((rc == 0)); then
+    echo -e "${GRY}>>${RST} ${C9}${desc}${RST} ${FG_OK}done${RST} ${GRY}(${elapsed}s)${RST}"
+  fi
+  return $rc
+}
+
 ok()   { echo -e "${BG_OK} OK ${RST} ${FG_OK}$1${RST}"; }
 err()  { echo -e "${BG_ERR} ERROR ${RST} ${FG_ERR}$1${RST}"; }
 warn() { echo -e "${BG_WARN} WARN ${RST} ${FG_WARN}$1${RST}"; }
@@ -172,9 +215,9 @@ detect_public_ip() {
 geo_cc() {
   # returns 2-letter country code, empty on failure
   local ip="$1" cc=""
-  cc="$(timeout 6 curl -s "http://ip-api.com/line/${ip}?fields=countryCode" 2>/dev/null | tr -dc 'A-Za-z')"
-  [[ ${#cc} -ne 2 ]] && cc="$(timeout 6 curl -s "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -dc 'A-Za-z')"
-  [[ ${#cc} -ne 2 ]] && cc="$(timeout 6 curl -s "https://ipwho.is/${ip}?fields=country_code" 2>/dev/null | tr -dc 'A-Za-z')"
+  cc="$(timeout 4 curl -s "http://ip-api.com/line/${ip}?fields=countryCode" 2>/dev/null | tr -dc 'A-Za-z')"
+  [[ ${#cc} -ne 2 ]] && cc="$(timeout 4 curl -s "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -dc 'A-Za-z')"
+  [[ ${#cc} -ne 2 ]] && cc="$(timeout 4 curl -s "https://ipwho.is/${ip}?fields=country_code" 2>/dev/null | tr -dc 'A-Za-z')"
   [[ ${#cc} -eq 2 ]] && echo "${cc^^}" || echo ""
 }
 
@@ -268,29 +311,92 @@ preflight() {
   return $fatal
 }
 
+wait_apt_lock() {
+  local i=0 held=0
+  while ((i < 60)); do
+    held=0
+    for f in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+      [[ -e "$f" ]] || continue
+      if command -v fuser >/dev/null 2>&1; then
+        fuser "$f" >/dev/null 2>&1 && held=1
+      elif command -v lsof >/dev/null 2>&1; then
+        lsof "$f" >/dev/null 2>&1 && held=1
+      fi
+    done
+    ((held == 0)) && return 0
+    ((i == 0)) && warn "Another package manager is running. Waiting up to 120s..."
+    printf "\r${GRY}>> waiting for apt lock [%ds]${RST}    " "$((i * 2))"
+    sleep 2; i=$((i + 1))
+  done
+  printf "\r%*s\r" 78 ""
+  warn "apt lock still held. Disabling unattended-upgrades for this run."
+  systemctl stop unattended-upgrades >/dev/null 2>&1
+  pkill -9 -f unattended-upgrade >/dev/null 2>&1
+  return 0
+}
+
+swan_present() { command -v ipsec >/dev/null 2>&1 || command -v swanctl >/dev/null 2>&1; }
+
 # ---------- dependencies ----------
 install_deps() {
-  step "Installing dependencies"
   export DEBIAN_FRONTEND=noninteractive
-  if command -v apt-get >/dev/null 2>&1; then
-    timeout 180 apt-get update -qq >/dev/null 2>&1
-    timeout 300 apt-get install -y -qq iproute2 iptables curl iputils-ping \
-      strongswan strongswan-starter strongswan-swanctl libstrongswan-standard-plugins \
-      libcharon-extra-plugins >/dev/null 2>&1
-    if ! command -v ipsec >/dev/null 2>&1 && ! command -v swanctl >/dev/null 2>&1; then
-      timeout 300 apt-get install -y -qq strongswan >/dev/null 2>&1
+  export NEEDRESTART_MODE=a
+  export NEEDRESTART_SUSPEND=1
+  export UCF_FORCE_CONFOLD=1
+  : > "$INSTALL_LOG" 2>/dev/null
+
+  if swan_present; then
+    detect_backend
+    if [[ -n "$BACKEND" ]]; then
+      ok "strongSwan already installed. Skipping package installation."
+      ok "Backend: ${BACKEND}${SWAN_SVC:+ (${SWAN_SVC})}"
+      return 0
     fi
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_apt_lock
+    local apt_opts=(-y -q
+      -o Dpkg::Options::=--force-confdef
+      -o Dpkg::Options::=--force-confold
+      -o Dpkg::Use-Pty=0
+      -o Acquire::Retries=2
+      -o Acquire::http::Timeout=15
+      -o Acquire::https::Timeout=15)
+
+    run_step "Updating package lists" 150 apt-get update "${apt_opts[@]}" \
+      || warn "apt update failed or timed out. Continuing with cached lists."
+
+    run_step "Installing base tools" 180 \
+      apt-get install "${apt_opts[@]}" iproute2 iptables curl iputils-ping \
+      || warn "Some base tools may be missing."
+
+    run_step "Installing strongSwan" 300 \
+      apt-get install "${apt_opts[@]}" strongswan strongswan-starter strongswan-swanctl \
+      libstrongswan-standard-plugins libcharon-extra-plugins
+    if [[ $? -eq 124 ]]; then
+      warn "Package install was interrupted. Repairing dpkg state."
+      run_step "Repairing dpkg" 180 dpkg --configure -a
+    fi
+    if ! swan_present; then
+      run_step "Installing strongSwan (fallback)" 240 apt-get install "${apt_opts[@]}" strongswan
+    fi
+
   elif command -v dnf >/dev/null 2>&1; then
-    timeout 300 dnf install -y -q iproute iptables curl iputils strongswan >/dev/null 2>&1
+    run_step "Installing packages" 300 dnf install -y -q iproute iptables curl iputils strongswan
   elif command -v yum >/dev/null 2>&1; then
-    timeout 300 yum install -y -q iproute iptables curl iputils strongswan >/dev/null 2>&1
+    run_step "Installing packages" 300 yum install -y -q iproute iptables curl iputils strongswan
+  elif command -v apk >/dev/null 2>&1; then
+    run_step "Installing packages" 240 apk add --no-cache iproute2 iptables curl strongswan
   else
     warn "Unknown package manager. Install strongSwan manually."
   fi
 
   detect_backend
   if [[ -z "$BACKEND" ]]; then
-    err "strongSwan was not installed. Install it manually and re-run."
+    err "strongSwan was not installed."
+    err "Last lines of $INSTALL_LOG:"
+    tail -n 15 "$INSTALL_LOG" 2>/dev/null | sed "s/^/${GRY}    /;s/$/${RST}/"
     return 1
   fi
   ok "Dependencies ready. Backend: ${BACKEND}${SWAN_SVC:+ (${SWAN_SVC})}"
@@ -347,12 +453,14 @@ gather_inputs() {
   ask_num "Tunnel MTU" "1400" 576 1500 MTU
 
   local def_psk
-  def_psk="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-28)"
+  def_psk="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-28)"
   while true; do
     read -rp "$(echo -e "${C8}Shared Secret (PSK)${RST} ${GRY}(${WHT}${def_psk}${GRY})${RST}: ")" psk_in
     psk_in="${psk_in:-$def_psk}"
-    ((${#psk_in} >= 8)) && { PSK="$psk_in"; break; }
-    err "PSK must be at least 8 characters."
+    if [[ "$psk_in" =~ ^[A-Za-z0-9._@#%^*+=-]{8,64}$ ]]; then
+      PSK="$psk_in"; break
+    fi
+    err "PSK must be 8-64 chars: letters, digits and . _ @ # % ^ * + = - only."
   done
 
   echo
@@ -655,6 +763,11 @@ run_diagnostics() {
   echo -e "${C2}  4. Peer public IP typed incorrectly on one side${RST}"
   echo -e "${C3}  5. Server is a container (LXC/OpenVZ) without kernel GRE support${RST}"
   echo -e "${C4}  6. Peer server not installed yet${RST}"
+  if [[ -s "$INSTALL_LOG" ]]; then
+    line
+    echo -e "${C5}Last lines of install log ($INSTALL_LOG)${RST}"
+    tail -n 12 "$INSTALL_LOG" 2>/dev/null | sed "s/^/${GRY}  /;s/$/${RST}/"
+  fi
   pause
 }
 
@@ -691,15 +804,12 @@ do_install() {
   step "Applying sysctl settings";     apply_sysctl
   step "Opening firewall (udp/500, udp/4500, esp, gre)"; open_firewall
 
-  step "Starting GRE interface"
-  timeout 20 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-  timeout 30 systemctl restart "$SERVICE_NAME" >/dev/null 2>&1
+  systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+  run_step "Starting GRE interface" 45 systemctl restart "$SERVICE_NAME"
 
-  step "Restarting strongSwan"
-  restart_swan
+  run_step "Restarting strongSwan" 60 restart_swan
 
-  step "Negotiating IPsec SA"
-  bring_up_sa
+  run_step "Negotiating IPsec SA" 40 bring_up_sa
   wait_for_sa 8
 
   # shellcheck disable=SC1090
