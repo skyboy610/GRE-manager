@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================
 #  GRE over IPsec Tunnel Manager
-#  Version: 2.1.0
+#  Version: 2.2.1
 # =============================================================
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.1"
 INSTALL_LOG="/var/log/gre-ipsec-install.log"
 CONF_DIR="/etc/gre-ipsec"
 CONF_FILE="$CONF_DIR/tunnel.conf"
@@ -403,9 +403,80 @@ install_deps() {
   return 0
 }
 
+# ---------- join token ----------
+make_token() {
+  local peer_role
+  [[ "$ROLE" == "iran" ]] && peer_role="kharej" || peer_role="iran"
+  printf 'GREIPSEC1|%s|%s|%s|%s|%s|%s|%s' \
+    "$peer_role" "$REMOTE_PUB" "$LOCAL_PUB" "$TUN_REMOTE" "$TUN_LOCAL" "$MTU" "$PSK" \
+    | base64 | tr -d '\n'
+}
+
+gather_from_token() {
+  local tok="" decoded="" go=""
+  local -a f=()
+  while true; do
+    echo
+    echo -e "${C10}Paste the token shown by menu option 5 on the first server.${RST}"
+    read -rp "$(echo -e "${C7}Join token${RST} ${GRY}(or type ${WHT}back${GRY})${RST}: ")" tok
+    [[ "$tok" == "back" ]] && return 1
+    decoded="$(echo "$tok" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)"
+    IFS='|' read -ra f <<< "$decoded"
+    if [[ ${#f[@]} -eq 8 && "${f[0]}" == "GREIPSEC1" ]] \
+       && valid_ip "${f[2]}" && valid_ip "${f[3]}" \
+       && valid_ip "${f[4]}" && valid_ip "${f[5]}" \
+       && [[ "${f[6]}" =~ ^[0-9]+$ ]] && [[ -n "${f[7]}" ]]; then
+      ROLE="${f[1]}"; LOCAL_PUB="${f[2]}"; REMOTE_PUB="${f[3]}"
+      TUN_LOCAL="${f[4]}"; TUN_REMOTE="${f[5]}"; MTU="${f[6]}"; PSK="${f[7]}"
+      break
+    fi
+    err "Invalid or corrupted token. Copy the whole line and try again."
+  done
+
+  PRIV_IP="$(detect_priv_ip)"
+  local detected
+  detected="$(detect_public_ip)"
+  if [[ -n "$detected" && "$detected" != "$LOCAL_PUB" ]]; then
+    warn "Token says this server is $LOCAL_PUB but detected IP is $detected."
+    local fix=""
+    ask_choice "Use detected IP instead? y/n" "n" fix "y" "n" "Y" "N"
+    [[ "${fix,,}" == "y" ]] && LOCAL_PUB="$detected"
+  fi
+  if [[ -n "$PRIV_IP" && "$PRIV_IP" != "$LOCAL_PUB" ]]; then
+    NAT_MODE="1"
+    warn "NAT detected: interface IP $PRIV_IP differs from public IP $LOCAL_PUB."
+  else
+    NAT_MODE="0"
+  fi
+
+  echo
+  line
+  echo -e "${C9}Review (from token)${RST}"
+  echo -e "${C1}  Role            ${WHT}${ROLE^^}${RST}"
+  echo -e "${C2}  Local Public    ${WHT}${LOCAL_PUB}${RST}"
+  echo -e "${C3}  Peer Public     ${WHT}${REMOTE_PUB}${RST}"
+  echo -e "${C5}  Local Tunnel    ${WHT}${TUN_LOCAL}/30${RST}"
+  echo -e "${C6}  Peer Tunnel     ${WHT}${TUN_REMOTE}/30${RST}"
+  echo -e "${C7}  MTU             ${WHT}${MTU}${RST}"
+  echo -e "${C11}  PSK             ${WHT}${PSK}${RST}"
+  line
+  ask_choice "Proceed with these settings? y/n" "y" go "y" "n" "Y" "N"
+  [[ "${go,,}" == "y" ]]
+}
+
 # ---------- input gathering ----------
 gather_inputs() {
-  local detected role_in="" psk_in="" go=""
+  local detected role_in="" psk_in="" go="" method=""
+
+  echo -e "${C1}Setup Method${RST}"
+  echo -e "${C2}  1) New tunnel        ${GRY}- this is the first server${RST}"
+  echo -e "${C3}  2) Join with token   ${GRY}- paste token from the first server${RST}"
+  ask_choice "Select method" "1" method "1" "2"
+  if [[ "$method" == "2" ]]; then
+    gather_from_token && return 0
+    warn "Falling back to manual setup."
+  fi
+
   detected="$(detect_public_ip)"
   PRIV_IP="$(detect_priv_ip)"
 
@@ -669,22 +740,35 @@ open_firewall() {
 
 restart_swan() {
   if [[ -n "$SWAN_SVC" ]]; then
-    timeout 30 systemctl enable "$SWAN_SVC" >/dev/null 2>&1
-    timeout 40 systemctl restart "$SWAN_SVC" >/dev/null 2>&1
+    timeout 30 systemctl enable "$SWAN_SVC" >>"$INSTALL_LOG" 2>&1
+    timeout 40 systemctl restart "$SWAN_SVC" >>"$INSTALL_LOG" 2>&1
+    systemctl is-active "$SWAN_SVC" >>"$INSTALL_LOG" 2>&1 \
+      || echo "WARNING: $SWAN_SVC is not active after restart" >>"$INSTALL_LOG"
   else
-    timeout 40 ipsec restart >/dev/null 2>&1
+    timeout 40 ipsec restart >>"$INSTALL_LOG" 2>&1
   fi
   sleep 3
   if [[ "$BACKEND" == "swanctl" ]]; then
-    timeout 20 swanctl --load-all >/dev/null 2>&1
+    timeout 20 swanctl --load-all >>"$INSTALL_LOG" 2>&1
   fi
+  return 0
 }
 
 bring_up_sa() {
   if [[ "$BACKEND" == "swanctl" ]]; then
-    timeout 25 swanctl --initiate --child gre >/dev/null 2>&1
+    timeout 25 swanctl --initiate --child gre >>"$INSTALL_LOG" 2>&1
   else
-    timeout 25 ipsec up "$CONN_NAME" >/dev/null 2>&1
+    timeout 25 ipsec up "$CONN_NAME" >>"$INSTALL_LOG" 2>&1
+  fi
+  return 0
+}
+
+ipsec_log_tail() {
+  local n="${1:-20}"
+  if [[ -n "$SWAN_SVC" ]] && journalctl -u "$SWAN_SVC" -n "$n" --no-pager >/dev/null 2>&1; then
+    journalctl -u "$SWAN_SVC" -n "$n" --no-pager 2>/dev/null
+  else
+    grep -i charon /var/log/syslog /var/log/messages 2>/dev/null | tail -n "$n"
   fi
 }
 
@@ -722,6 +806,108 @@ success_screen() {
   green_box_line "  Interface: $IF_NAME    MTU: $MTU    Encrypted: yes"
   green_box_line ""
   echo
+}
+
+classify_ike() {
+  local log=""
+  log="$(ipsec_log_tail 150 2>/dev/null)"
+
+  if grep -qi "ESTABLISHED" <<<"$log"; then echo "ok"; return; fi
+  if grep -qiE "AUTHENTICATION_FAILED|no shared key found|no matching peer config|invalid HASH|shared key.*not found" <<<"$log"; then
+    echo "auth"; return
+  fi
+  if grep -qiE "NO_PROPOSAL_CHOSEN|no matching proposal|no acceptable proposal" <<<"$log"; then
+    echo "proposal"; return
+  fi
+  if grep -qiE "retransmit [0-9]+ of request|giving up after [0-9]+ retransmits|establishing IKE_SA failed, peer not responding" <<<"$log"; then
+    echo "noreply"; return
+  fi
+  if grep -qiE "TS_UNACCEPTABLE|no acceptable traffic selectors" <<<"$log"; then
+    echo "ts"; return
+  fi
+  echo "unknown"
+}
+
+connectivity_probe() {
+  header
+  status_banner
+  if ! is_installed; then
+    err "No tunnel configured on this server."
+    pause; return
+  fi
+  # shellcheck disable=SC1090
+  source "$CONF_FILE"
+  detect_backend
+
+  echo -e "${C1}Connectivity Probe${RST}"
+  line
+
+  step "1/4  ICMP to peer public IP ($REMOTE_PUB)"
+  if timeout 12 ping -c 3 -W 2 "$REMOTE_PUB" >/dev/null 2>&1; then
+    ok "Peer public IP replies to ping."
+  else
+    warn "No ICMP reply from $REMOTE_PUB (many providers block ICMP - not conclusive)."
+  fi
+
+  step "2/4  Attempting IKE negotiation"
+  bring_up_sa
+  wait_for_sa 4
+  local verdict
+  verdict="$(classify_ike)"
+
+  step "3/4  GRE interface state"
+  if iface_up; then ok "Local GRE interface is up."; else err "Local GRE interface is down."; fi
+
+  step "4/4  Watching for inbound GRE packets (10s)"
+  local gre_rx="unknown"
+  if command -v tcpdump >/dev/null 2>&1; then
+    gre_rx="$(timeout 12 tcpdump -ni any proto 47 -c 5 2>/dev/null | grep -c "$REMOTE_PUB")"
+    if [[ "$gre_rx" =~ ^[0-9]+$ ]] && ((gre_rx > 0)); then
+      ok "GRE packets from peer are arriving ($gre_rx seen)."
+    else
+      warn "No GRE packets received from the peer in 10s."
+    fi
+  else
+    warn "tcpdump not installed - skipping packet capture."
+  fi
+
+  echo
+  line
+  echo -e "${C9}Verdict${RST}"
+  case "$verdict" in
+    ok)
+      ok "IPsec SA is established. If ping still fails, protocol 47 (GRE) is blocked in transit."
+      echo -e "${C10}  Ask the provider whether GRE is permitted, or switch to a UDP-based tunnel.${RST}"
+      ;;
+    auth)
+      err "AUTHENTICATION FAILURE - the two servers do not share the same PSK."
+      echo -e "${C10}  This is the most common cause. The random PSK differs on each server.${RST}"
+      echo -e "${C11}  Fix: on the first server open menu 5, copy the join token,${RST}"
+      echo -e "${C1}  then reinstall on this server with 'Join with token'.${RST}"
+      ;;
+    proposal)
+      err "CRYPTO MISMATCH - the peers could not agree on an algorithm."
+      echo -e "${C10}  Usually different strongSwan versions. Reinstall both sides with v${VERSION}.${RST}"
+      ;;
+    noreply)
+      err "NO RESPONSE from the peer during IKE."
+      echo -e "${C10}  1. The peer server is not installed or strongSwan is not running there${RST}"
+      echo -e "${C11}  2. UDP 500 / 4500 is filtered between the two servers${RST}"
+      echo -e "${C1}  3. The peer public IP is wrong on one side${RST}"
+      ;;
+    ts)
+      err "TRAFFIC SELECTOR MISMATCH - one side is not offering the GRE selector."
+      echo -e "${C10}  Reinstall both sides with the same script version.${RST}"
+      ;;
+    *)
+      warn "Could not classify the failure automatically."
+      ;;
+  esac
+  line
+  echo -e "${C8}Live strongSwan log (last 18 lines)${RST}"
+  ipsec_log_tail 18 | sed "s/^/${GRY}  /;s/$/${RST}/"
+  line
+  pause
 }
 
 # ---------- diagnostics ----------
@@ -832,8 +1018,15 @@ do_install() {
   ((ping_ok == 1)) && ok "Peer $TUN_REMOTE is reachable." || err "Peer $TUN_REMOTE is not reachable."
   echo
   warn "Tunnel is not fully up yet."
-  warn "If the peer server is not configured, install there and run Auto Test."
-  warn "Otherwise use menu option 6 (Diagnostics) to find the cause."
+  local v
+  v="$(classify_ike)"
+  case "$v" in
+    auth)     err "Cause: PSK mismatch between the two servers." ;;
+    noreply)  err "Cause: no IKE response - peer not installed, or UDP 500/4500 filtered." ;;
+    proposal) err "Cause: crypto proposal mismatch between the two servers." ;;
+    *)        warn "If the peer is not configured yet, install there and run Auto Test." ;;
+  esac
+  warn "Run menu option 6 (Connectivity Probe) for a full breakdown."
   pause
   return 1
 }
@@ -943,8 +1136,14 @@ peer_setup() {
   local peer_role
   [[ "$ROLE" == "iran" ]] && peer_role="KHAREJ" || peer_role="IRAN"
 
-  echo -e "${C1}Use these values when running this script on the PEER server:${RST}"
+  echo -e "${C1}Join token for the PEER server:${RST}"
   line
+  echo -e "${WHT}$(make_token)${RST}"
+  line
+  echo -e "${C9}On the peer server run this script, choose 1) Install Tunnel,${RST}"
+  echo -e "${C10}then 2) Join with token, and paste the line above.${RST}"
+  echo
+  echo -e "${C11}Manual values (only if you prefer typing them):${RST}"
   echo -e "${C2}  Role                 ${WHT}${peer_role}${RST}"
   echo -e "${C3}  This Server Public   ${WHT}${REMOTE_PUB}${RST}"
   echo -e "${C4}  Peer Server Public   ${WHT}${LOCAL_PUB}${RST}"
@@ -953,7 +1152,7 @@ peer_setup() {
   echo -e "${C7}  MTU                  ${WHT}${MTU}${RST}"
   echo -e "${C8}  Shared Secret (PSK)  ${WHT}${PSK}${RST}"
   line
-  warn "The PSK must be entered exactly the same on the peer server."
+  warn "The PSK must match exactly on both servers. The token guarantees this."
   pause
 }
 
@@ -1025,9 +1224,10 @@ main_menu() {
     echo -e "${C5}  2) Tunnel Management${RST}"
     echo -e "${C6}  3) Show Tunnel Info${RST}"
     echo -e "${C2}  4) Auto Test${RST}"
-    echo -e "${C8}  5) Peer Server Values${RST}"
-    echo -e "${C10}  6) Diagnostics${RST}"
-    echo -e "${C4}  7) Uninstall${RST}"
+    echo -e "${C8}  5) Peer Join Token${RST}"
+    echo -e "${C11}  6) Connectivity Probe${RST}"
+    echo -e "${C10}  7) Diagnostics${RST}"
+    echo -e "${C4}  8) Uninstall${RST}"
     echo -e "${GRY}  0) Exit${RST}"
     echo
     read -rp "$(echo -e "${C9}Select${RST} ${GRY}(${WHT}1${GRY})${RST}: ")" choice
@@ -1038,8 +1238,9 @@ main_menu() {
       3) show_info ;;
       4) auto_test ;;
       5) peer_setup ;;
-      6) run_diagnostics ;;
-      7) do_uninstall ;;
+      6) connectivity_probe ;;
+      7) run_diagnostics ;;
+      8) do_uninstall ;;
       0) echo; exit 0 ;;
       *) err "Invalid option."; sleep 1 ;;
     esac
